@@ -22,6 +22,41 @@ import logging
 
 
 # ============================================================================
+# VALIDATION ERROR TYPES
+# ============================================================================
+
+@dataclass
+class ValidationError:
+    """Structured validation error with context."""
+    category: str  # "hardware", "compliance", "file_path", "tool_version", "parameter"
+    field: str     # Specific field that failed validation
+    message: str   # Human-readable error message
+    severity: str  # "error", "warning"
+    value: Any = None  # Current value that failed
+    expected: Any = None  # Expected value or constraint
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            'category': self.category,
+            'field': self.field,
+            'message': self.message,
+            'severity': self.severity,
+            'value': self.value,
+            'expected': self.expected
+        }
+    
+    def __str__(self) -> str:
+        """String representation for logging."""
+        parts = [f"[{self.category.upper()}]", self.field, "-", self.message]
+        if self.value is not None:
+            parts.append(f"(current: {self.value})")
+        if self.expected is not None:
+            parts.append(f"(expected: {self.expected})")
+        return " ".join(str(p) for p in parts)
+
+
+# ============================================================================
 # ENUMERATIONS
 # ============================================================================
 
@@ -130,24 +165,59 @@ class HardwareConfig:
     memory_system_reserve_percent: float = 10.0
     disk_safety_margin_gb: float = 100.0
     
-    def validate(self) -> Tuple[bool, List[str]]:
+    def validate(self) -> Tuple[bool, List[ValidationError]]:
         """Validate hardware configuration."""
         errors = []
         
         if self.max_cpu_cores < 1:
-            errors.append("max_cpu_cores must be >= 1")
+            errors.append(ValidationError(
+                category="hardware",
+                field="max_cpu_cores",
+                message="must be >= 1",
+                severity="error",
+                value=self.max_cpu_cores,
+                expected=">= 1"
+            ))
         
         if self.max_memory_gb < 1.0:
-            errors.append("max_memory_gb must be >= 1.0")
+            errors.append(ValidationError(
+                category="hardware",
+                field="max_memory_gb",
+                message="must be >= 1.0",
+                severity="error",
+                value=self.max_memory_gb,
+                expected=">= 1.0"
+            ))
         
         if self.max_parallel_tasks > self.max_cpu_cores:
-            errors.append("max_parallel_tasks cannot exceed max_cpu_cores")
+            errors.append(ValidationError(
+                category="hardware",
+                field="max_parallel_tasks",
+                message="cannot exceed max_cpu_cores",
+                severity="error",
+                value=self.max_parallel_tasks,
+                expected=f"<= {self.max_cpu_cores}"
+            ))
         
         if not 0 <= self.cpu_system_reserve_percent <= 50:
-            errors.append("cpu_system_reserve_percent must be between 0 and 50")
+            errors.append(ValidationError(
+                category="hardware",
+                field="cpu_system_reserve_percent",
+                message="must be between 0 and 50",
+                severity="error",
+                value=self.cpu_system_reserve_percent,
+                expected="0-50"
+            ))
         
         if not 0 <= self.memory_system_reserve_percent <= 50:
-            errors.append("memory_system_reserve_percent must be between 0 and 50")
+            errors.append(ValidationError(
+                category="hardware",
+                field="memory_system_reserve_percent",
+                message="must be between 0 and 50",
+                severity="error",
+                value=self.memory_system_reserve_percent,
+                expected="0-50"
+            ))
         
         return len(errors) == 0, errors
 
@@ -647,19 +717,19 @@ class PipelineConfig:
         # Compute configuration checksum
         self.config_checksum = self.compute_checksum()
     
-    def validate(self) -> Tuple[bool, List[str]]:
+    def validate(self) -> Tuple[bool, List['ValidationError']]:
         """
         Comprehensive validation of all configuration parameters.
         
         Returns:
-            Tuple of (is_valid, list_of_errors)
+            Tuple of (is_valid, list_of_validation_errors)
         """
         errors = []
         
         # Validate hardware
         hw_valid, hw_errors = self.hardware.validate()
         if not hw_valid:
-            errors.extend([f"Hardware: {e}" for e in hw_errors])
+            errors.extend(hw_errors)
         
         # Validate cross-parameter constraints
         errors.extend(self._validate_cross_parameter_constraints())
@@ -676,17 +746,63 @@ class PipelineConfig:
         
         return len(errors) == 0, errors
     
-    def _validate_cross_parameter_constraints(self) -> List[str]:
+    def _validate_cross_parameter_constraints(self) -> List[ValidationError]:
         """Validate dependencies between configuration parameters."""
         errors = []
         
         # Parallelism constraint
         min_cpu_per_task = 4
         if self.hardware.max_parallel_tasks > self.hardware.max_cpu_cores / min_cpu_per_task:
-            errors.append(
-                f"max_parallel_tasks ({self.hardware.max_parallel_tasks}) too high for "
-                f"available CPUs ({self.hardware.max_cpu_cores})"
-            )
+            errors.append(ValidationError(
+                category="parameter",
+                field="hardware.max_parallel_tasks",
+                message="too high for available CPUs",
+                severity="error",
+                value=self.hardware.max_parallel_tasks,
+                expected=f"<= {self.hardware.max_cpu_cores / min_cpu_per_task:.0f}"
+            ))
+        
+        # Memory constraint for variant processing
+        estimated_memory_per_task = 16.0
+        total_memory_needed = estimated_memory_per_task * self.hardware.max_parallel_tasks
+        if total_memory_needed > self.hardware.max_memory_gb * 0.9:
+            errors.append(ValidationError(
+                category="parameter",
+                field="hardware.max_parallel_tasks",
+                message="insufficient memory for parallel tasks",
+                severity="error",
+                value=f"{total_memory_needed:.1f}GB needed",
+                expected=f"<= {self.hardware.max_memory_gb * 0.9:.1f}GB available"
+            ))
+        
+        # Timeout hierarchy
+        total_stage_timeout = (
+            self.execution.alignment_timeout_hours +
+            self.execution.variant_calling_timeout_hours +
+            self.execution.annotation_timeout_hours
+        )
+        if self.execution.total_pipeline_timeout_hours < total_stage_timeout:
+            errors.append(ValidationError(
+                category="parameter",
+                field="execution.total_pipeline_timeout_hours",
+                message="must be >= sum of stage timeouts",
+                severity="error",
+                value=self.execution.total_pipeline_timeout_hours,
+                expected=f">= {total_stage_timeout}"
+            ))
+        
+        # Reference genome version consistency
+        if self.tools.vep_version != self.reference_genome.ensembl_version:
+            errors.append(ValidationError(
+                category="tool_version",
+                field="tools.vep_version",
+                message="should match Ensembl version",
+                severity="warning",
+                value=self.tools.vep_version,
+                expected=self.reference_genome.ensembl_version
+            ))
+        
+        return errors
         
         # Memory constraint for variant processing
         estimated_memory_per_task = 16.0
@@ -718,103 +834,177 @@ class PipelineConfig:
         
         return errors
     
-    def _validate_file_paths(self) -> List[str]:
+    def _validate_file_paths(self) -> List[ValidationError]:
         """Validate that required files exist."""
         errors = []
         
         critical_files = [
-            ("Reference genome FASTA", self.reference_genome.fasta_path),
-            ("Reference genome index", self.reference_genome.fai_path),
-            ("Reference genome dict", self.reference_genome.dict_path),
-            ("Ensembl GTF", self.reference_genome.ensembl_gtf_path),
-            ("IndiGenomes VCF", self.population_databases.indigenomes_vcf_path),
-            ("ClinVar VCF", self.clinical_databases.clinvar_vcf_path),
+            ("Reference genome FASTA", "reference_genome.fasta_path", self.reference_genome.fasta_path),
+            ("Reference genome index", "reference_genome.fai_path", self.reference_genome.fai_path),
+            ("Reference genome dict", "reference_genome.dict_path", self.reference_genome.dict_path),
+            ("Ensembl GTF", "reference_genome.ensembl_gtf_path", self.reference_genome.ensembl_gtf_path),
+            ("IndiGenomes VCF", "population_databases.indigenomes_vcf_path", self.population_databases.indigenomes_vcf_path),
+            ("ClinVar VCF", "clinical_databases.clinvar_vcf_path", self.clinical_databases.clinvar_vcf_path),
         ]
         
-        for name, path in critical_files:
+        for name, field, path in critical_files:
             if not path.exists():
-                errors.append(f"Missing required file: {name} at {path}")
+                errors.append(ValidationError(
+                    category="file_path",
+                    field=field,
+                    message=f"required file not found: {name}",
+                    severity="error",
+                    value=str(path),
+                    expected="file must exist"
+                ))
         
         # Validate tool executables
         tool_paths = [
-            ("GATK", self.tools.gatk_path),
-            ("DeepVariant", self.tools.deepvariant_path),
-            ("BWA-MEM2", self.tools.bwa_mem2_path),
-            ("SAMtools", self.tools.samtools_path),
-            ("BCFtools", self.tools.bcftools_path),
-            ("VEP", self.tools.vep_path),
+            ("GATK", "tools.gatk_path", self.tools.gatk_path),
+            ("DeepVariant", "tools.deepvariant_path", self.tools.deepvariant_path),
+            ("BWA-MEM2", "tools.bwa_mem2_path", self.tools.bwa_mem2_path),
+            ("SAMtools", "tools.samtools_path", self.tools.samtools_path),
+            ("BCFtools", "tools.bcftools_path", self.tools.bcftools_path),
+            ("VEP", "tools.vep_path", self.tools.vep_path),
         ]
         
-        for name, path in tool_paths:
+        for name, field, path in tool_paths:
             if not path.exists():
-                errors.append(f"Missing required tool: {name} at {path}")
+                errors.append(ValidationError(
+                    category="file_path",
+                    field=field,
+                    message=f"required tool not found: {name}",
+                    severity="error",
+                    value=str(path),
+                    expected="executable must exist"
+                ))
         
         return errors
     
-    def _validate_regulatory_compliance(self) -> List[str]:
+    def _validate_regulatory_compliance(self) -> List[ValidationError]:
         """Validate regulatory compliance requirements."""
         errors = []
         
         if self.audit_compliance.regulatory_framework == RegulatoryFramework.ICMR_NABL:
             # ICMR/NABL requires 10+ year retention
             if self.audit_compliance.audit_log_retention_days < 365 * 10:
-                errors.append(
-                    f"ICMR/NABL requires audit log retention >= 10 years, "
-                    f"configured: {self.audit_compliance.audit_log_retention_days} days"
-                )
+                errors.append(ValidationError(
+                    category="compliance",
+                    field="audit_compliance.audit_log_retention_days",
+                    message="ICMR/NABL requires audit log retention >= 10 years",
+                    severity="error",
+                    value=self.audit_compliance.audit_log_retention_days,
+                    expected=">= 3650 days"
+                ))
             
             # Must have accreditation ID
             if not self.audit_compliance.lab_accreditation_id:
-                errors.append("ICMR/NABL requires lab_accreditation_id")
+                errors.append(ValidationError(
+                    category="compliance",
+                    field="audit_compliance.lab_accreditation_id",
+                    message="ICMR/NABL requires lab_accreditation_id",
+                    severity="error",
+                    value=None,
+                    expected="non-empty string"
+                ))
         
         # Secondary findings require gene list
         if self.clinical_reporting.report_secondary_findings:
             if not self.clinical_reporting.acmg_sf_gene_list.exists():
-                errors.append(
-                    "report_secondary_findings enabled but acmg_sf_gene_list not found"
-                )
+                errors.append(ValidationError(
+                    category="compliance",
+                    field="clinical_reporting.acmg_sf_gene_list",
+                    message="report_secondary_findings enabled but gene list not found",
+                    severity="error",
+                    value=str(self.clinical_reporting.acmg_sf_gene_list),
+                    expected="file must exist"
+                ))
         
         # Encryption requirements for production
         if self.environment.environment == EnvironmentType.PRODUCTION:
             if not self.audit_compliance.encrypt_data_at_rest:
-                errors.append("Production environment requires encrypt_data_at_rest=True")
+                errors.append(ValidationError(
+                    category="compliance",
+                    field="audit_compliance.encrypt_data_at_rest",
+                    message="production environment requires encryption",
+                    severity="error",
+                    value=False,
+                    expected=True
+                ))
         
         return errors
     
-    def _validate_tool_compatibility(self) -> List[str]:
+    def _validate_tool_compatibility(self) -> List[ValidationError]:
         """Validate tool version compatibility."""
         errors = []
         
         # GATK version compatibility
         gatk_version = self.tools.gatk_version
         if not gatk_version.startswith("4."):
-            errors.append(f"GATK version {gatk_version} not supported, requires 4.x")
+            errors.append(ValidationError(
+                category="tool_version",
+                field="tools.gatk_version",
+                message="GATK version not supported, requires 4.x",
+                severity="error",
+                value=gatk_version,
+                expected="4.x"
+            ))
         
         # DeepVariant model compatibility
         model_type = self.parameters.deepvariant_model_type
         valid_models = ["WGS", "WES", "PACBIO", "HYBRID"]
         if model_type not in valid_models:
-            errors.append(
-                f"Invalid DeepVariant model type: {model_type}, "
-                f"must be one of {valid_models}"
-            )
+            errors.append(ValidationError(
+                category="parameter",
+                field="parameters.deepvariant_model_type",
+                message="invalid DeepVariant model type",
+                severity="error",
+                value=model_type,
+                expected=f"one of {valid_models}"
+            ))
         
         return errors
     
     def compute_checksum(self) -> str:
         """
         Compute SHA256 checksum of configuration for versioning.
+        Normalizes and sorts configuration before hashing for determinism.
         
         Returns:
             Hex string of configuration checksum
         """
-        # Serialize config to canonical JSON
+        # Serialize config to dictionary
         config_dict = self.to_dict()
-        # Remove checksum field before computing
-        config_dict.pop('config_checksum', None)
         
-        canonical_json = json.dumps(config_dict, sort_keys=True, indent=2)
-        checksum = hashlib.sha256(canonical_json.encode()).hexdigest()
+        # Remove checksum and timestamp fields before computing
+        config_dict.pop('config_checksum', None)
+        config_dict.pop('config_last_modified', None)
+        
+        # Normalize and sort for deterministic serialization
+        def normalize_dict(d):
+            """Recursively normalize dictionary for deterministic serialization."""
+            if isinstance(d, dict):
+                return {k: normalize_dict(v) for k, v in sorted(d.items())}
+            elif isinstance(d, list):
+                # Sort lists that are sets (like GPUs), preserve order for sequences
+                return [normalize_dict(item) for item in d]
+            elif isinstance(d, (str, int, float, bool, type(None))):
+                return d
+            else:
+                return str(d)
+        
+        normalized_config = normalize_dict(config_dict)
+        
+        # Serialize to canonical JSON (sorted keys, consistent formatting)
+        canonical_json = json.dumps(
+            normalized_config,
+            sort_keys=True,
+            indent=None,
+            separators=(',', ':')
+        )
+        
+        # Compute SHA256
+        checksum = hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()
         
         return checksum
     
@@ -1044,34 +1234,47 @@ class ConfigurationManager:
     def build_config(self, run_config_path: Optional[Path] = None) -> PipelineConfig:
         """
         Build final configuration with all overrides applied.
+        Pure function with no side effects - does not modify any state.
         
         Args:
             run_config_path: Optional path to run-specific config
         
         Returns:
             Final merged PipelineConfig
-        """
-        # Start with base
-        config = self.load_base_config()
         
-        # Apply site overrides
-        site_overrides = self.load_site_config()
-        if site_overrides:
+        Raises:
+            ValueError: If configuration validation fails
+        """
+        # Load base config (pure - reads file, no side effects)
+        if self.base_config_path.exists():
+            config = PipelineConfig.from_json(self.base_config_path)
+        else:
+            config = PipelineConfig()
+        
+        # Load site overrides (pure - reads file)
+        if self.site_config_path.exists():
+            with open(self.site_config_path, 'r') as f:
+                site_overrides = json.load(f)
+            # Create new config with overrides (pure - returns new instance)
             config = config.merge_override(site_overrides)
         
-        # Apply run overrides
-        run_overrides = self.load_run_config(run_config_path)
-        if run_overrides:
+        # Load run overrides (pure - reads file)
+        if run_config_path and run_config_path.exists():
+            with open(run_config_path, 'r') as f:
+                run_overrides = json.load(f)
+            # Create new config with overrides (pure - returns new instance)
             config = config.merge_override(run_overrides)
         
         # Validate final configuration
         is_valid, errors = config.validate()
         if not is_valid:
-            error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
-            self.logger.error(error_msg)
+            # Format structured errors for exception
+            error_lines = []
+            for err in errors:
+                error_lines.append(str(err))
+            
+            error_msg = "Configuration validation failed:\n" + "\n".join(f"  {e}" for e in error_lines)
             raise ValueError(error_msg)
-        
-        self.logger.info(f"Configuration built successfully. Checksum: {config.config_checksum}")
         
         return config
     
@@ -1111,7 +1314,7 @@ class ConfigurationManager:
         
         self.logger.info(f"Created run config: {output_path}")
     
-    def verify_dataset_integrity(self, config: PipelineConfig) -> Tuple[bool, List[str]]:
+    def verify_dataset_integrity(self, config: PipelineConfig) -> Tuple[bool, List[ValidationError]]:
         """
         Verify integrity of all datasets in configuration.
         
@@ -1119,19 +1322,22 @@ class ConfigurationManager:
             config: Configuration to verify
         
         Returns:
-            Tuple of (all_valid, list_of_failed_datasets)
+            Tuple of (all_valid, list_of_validation_errors)
         """
-        failed = []
+        errors = []
         
         for name, manifest in config.datasets.items():
             if not manifest.validate_integrity():
-                failed.append(f"{name}: Checksum mismatch or file missing")
-                self.logger.error(f"Dataset integrity check failed: {name}")
+                errors.append(ValidationError(
+                    category="file_path",
+                    field=f"datasets.{name}",
+                    message="dataset integrity check failed (checksum mismatch or file missing)",
+                    severity="error",
+                    value=str(manifest.file_path),
+                    expected=f"SHA256: {manifest.checksum_sha256}"
+                ))
         
-        if not failed:
-            self.logger.info("All datasets passed integrity verification")
-        
-        return len(failed) == 0, failed
+        return len(errors) == 0, errors
 
 
 # ============================================================================
